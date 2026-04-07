@@ -1,0 +1,9 @@
+gradio
+joblib
+lightgbm
+pandas
+requests
+scikit-learn
+streamlit
+xgboost
+geopy
