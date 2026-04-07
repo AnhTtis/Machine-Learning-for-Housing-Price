@@ -1,22 +1,89 @@
 import math
+import re
 import sys
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy import sparse
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import _column_transformer as sklearn_column_transformer
 
-import model_runtime as runtime
-from model_runtime import (
-    PROPERTY_TYPE_COL,
-    fill_area,
-    preprocess_raw_data,
-    sanitize_location_columns,
-)
+
+PROPERTY_TYPE_COL = "Loại hình"
+
+ADDRESS_TEXT_COLUMNS = [
+    "Đường",
+    "Số nhà",
+    "Phường/Xã cũ",
+    "Phường mới",
+    "Huyện/Quận cũ",
+    "Tỉnh/Thành phố cũ",
+    "Tỉnh/Thành phố mới",
+]
+
+ICON_PATTERN = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+", re.UNICODE)
+LEADING_TRAILING_DECORATION_PATTERN = re.compile(r"^[\s,.;:|/\-]+|[\s,.;:|/\-]+$", re.UNICODE)
+
+
+# scikit-learn 1.8 no longer exposes this private helper, but older 1.6.x
+# ColumnTransformer pickles may still reference it during unpickling.
+if not hasattr(sklearn_column_transformer, "_RemainderColsList"):
+    class _RemainderColsList(list):
+        pass
+
+
+    sklearn_column_transformer._RemainderColsList = _RemainderColsList
+
+
+def normalize_text_value(value):
+    if pd.isna(value):
+        return np.nan
+
+    text = str(value).strip()
+    if text == "" or text.lower() in {"nan", "none", "null"}:
+        return np.nan
+
+    text = ICON_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = LEADING_TRAILING_DECORATION_PATTERN.sub("", text).strip()
+    return text if text else np.nan
+
+
+def sanitize_location_columns(df: pd.DataFrame, columns=None) -> pd.DataFrame:
+    cleaned_df = df.copy()
+    for column in columns or ADDRESS_TEXT_COLUMNS:
+        if column in cleaned_df.columns:
+            cleaned_df[column] = cleaned_df[column].apply(normalize_text_value)
+    return cleaned_df
+
+
+class MatrixToFrameTransformer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        if hasattr(X, "columns"):
+            self.feature_names_in_ = list(X.columns)
+        elif not hasattr(self, "feature_names_in_"):
+            self.feature_names_in_ = None
+        return self
+
+    def transform(self, X):
+        if hasattr(X, "columns") or self.feature_names_in_ is None:
+            return X
+
+        if sparse.issparse(X):
+            return pd.DataFrame.sparse.from_spmatrix(X, columns=self.feature_names_in_)
+
+        X_array = np.asarray(X)
+        if X_array.ndim == 2 and X_array.shape[1] == len(self.feature_names_in_):
+            return pd.DataFrame(X_array, columns=self.feature_names_in_)
+        return X
+
 
 # Allow older joblib artifacts that were serialized with the training module path
 # to be loaded without importing the training script on deploy.
-sys.modules.setdefault("train_combo4_xgboost_pipeline", runtime)
+sys.modules.setdefault("train_combo4_xgboost_pipeline", sys.modules[__name__])
 
 
 MODEL_PATH = Path("artifacts/combo4_best_unit_price_pipeline.pkl")
@@ -46,14 +113,6 @@ def load_artifact():
 @st.cache_data
 def load_raw_address_data():
     df = pd.read_csv(DATA_PATH, low_memory=False, encoding="utf-8-sig")
-    return sanitize_location_columns(df)
-
-
-@st.cache_data
-def load_model_data():
-    df = pd.read_csv(DATA_PATH, low_memory=False, encoding="utf-8-sig")
-    df = preprocess_raw_data(df)
-    df = fill_area(df)
     return sanitize_location_columns(df)
 
 
@@ -174,7 +233,6 @@ def resolve_legacy_address_candidates(df, new_city, new_ward, street):
 
 artifact = load_artifact()
 raw_address_df = load_raw_address_data()
-model_data_df = load_model_data()
 feature_list = artifact["feature_list"]
 target_mode = artifact.get("target_mode", "price_direct")
 unit_price_scale = float(artifact.get("unit_price_scale", 1.0))
