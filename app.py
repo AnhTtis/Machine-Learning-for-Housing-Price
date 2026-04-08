@@ -1,15 +1,20 @@
 import math
 import re
 import sys
+import traceback
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import _column_transformer as sklearn_column_transformer
+
+try:
+    import joblib
+except ModuleNotFoundError:
+    joblib = None
 
 
 PROPERTY_TYPE_COL = "Loại hình"
@@ -84,6 +89,8 @@ class MatrixToFrameTransformer(BaseEstimator, TransformerMixin):
 # Allow older joblib artifacts that were serialized with the training module path
 # to be loaded without importing the training script on deploy.
 sys.modules.setdefault("train_combo4_xgboost_pipeline", sys.modules[__name__])
+sys.modules.setdefault("model_runtime", sys.modules[__name__])
+sys.modules.setdefault("__main__", sys.modules[__name__])
 
 
 MODEL_PATH = Path("artifacts/combo4_best_unit_price_pipeline.pkl")
@@ -105,9 +112,43 @@ SUBTYPE_FIELDS = [
 ]
 
 
+st.set_page_config(page_title="Dự đoán giá bất động sản", page_icon="🏠", layout="wide")
+
+
+if joblib is None:
+    st.error("Missing Python package: `joblib`.")
+    st.code("pip install -r requirements.txt", language="bash")
+    st.caption(
+        "If this is Streamlit Community Cloud, redeploy after confirming "
+        "`requirements.txt` is committed and the build cache is cleared."
+    )
+    st.stop()
+
+
 @st.cache_resource
 def load_artifact():
-    return joblib.load(MODEL_PATH)
+    try:
+        with MODEL_PATH.open("rb") as artifact_file:
+            header = artifact_file.read(64)
+
+        if header.startswith(b"version https://git-lfs.github.com/spec/"):
+            st.error("Model artifact was not downloaded. The deployed file is a Git LFS pointer, not the real `.pkl`.")
+            st.code("git lfs pull", language="bash")
+            st.caption(
+                "Your deployment needs Git LFS support or another way to fetch the real model file "
+                "before Streamlit starts."
+            )
+            st.stop()
+
+        return joblib.load(MODEL_PATH)
+    except Exception as exc:
+        st.error(f"Failed to load model artifact: `{type(exc).__name__}`")
+        st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), language="python")
+        st.caption(
+            "This usually means the saved `.pkl` was created with a different Python or library setup "
+            "than the current Streamlit runtime."
+        )
+        st.stop()
 
 
 @st.cache_data
@@ -237,8 +278,6 @@ feature_list = artifact["feature_list"]
 target_mode = artifact.get("target_mode", "price_direct")
 unit_price_scale = float(artifact.get("unit_price_scale", 1.0))
 property_type_column = artifact.get("property_type_column", PROPERTY_TYPE_COL)
-
-st.set_page_config(page_title="Dự đoán giá bất động sản", page_icon="🏠", layout="wide")
 
 st.title("Dự đoán giá bất động sản tại Việt Nam")
 st.caption(
