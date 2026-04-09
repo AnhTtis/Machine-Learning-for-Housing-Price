@@ -513,20 +513,40 @@ def prepare_model_dataframe(cleaned_df: pd.DataFrame) -> pd.DataFrame:
     return model_df
 
 
-def train_models_for_subset(model_df: pd.DataFrame, subset_name: str):
-    X = model_df[COMBO_4_FEATURES].copy()
-    y_unit_price = model_df[UNIT_PRICE_TARGET_COL].astype(float).copy()
-    area_series = model_df[AREA_COL].astype(float).copy()
-    y_price = model_df[TARGET_COL].astype(float).copy()
-
-    X_train, X_test, y_train_unit, _, _, area_test, _, y_test_price = train_test_split(
-        X,
-        y_unit_price,
-        area_series,
-        y_price,
+def split_model_dataframe(model_df: pd.DataFrame):
+    train_index, test_index = train_test_split(
+        model_df.index,
         test_size=TEST_SIZE,
         random_state=RANDOM_STATE,
     )
+    return model_df.loc[train_index].copy(), model_df.loc[test_index].copy()
+
+
+def evaluate_pipeline_on_dataframe(pipeline: Pipeline, eval_df: pd.DataFrame):
+    X_eval = eval_df[COMBO_4_FEATURES].copy()
+    area_eval = eval_df[AREA_COL].astype(float).to_numpy()
+    y_eval_price = eval_df[TARGET_COL].astype(float).to_numpy()
+    pred_unit_price = np.clip(np.asarray(pipeline.predict(X_eval), dtype=float), a_min=0.0, a_max=None)
+    pred_price = pred_unit_price * area_eval * UNIT_PRICE_SCALE
+    return regression_metrics(y_eval_price, pred_price)
+
+
+def make_benchmark_row(subset_name: str, rows: int, train_rows: int, test_rows: int, model_name: str, metrics: dict, source: str):
+    return {
+        "Property Type": subset_name,
+        "Rows": int(rows),
+        "Train Rows": int(train_rows),
+        "Test Rows": int(test_rows),
+        "Model": model_name,
+        "Source": source,
+        "Target": "Đơn giá x Diện tích",
+        **metrics,
+    }
+
+
+def train_models_for_subset(train_df: pd.DataFrame, test_df: pd.DataFrame, subset_name: str):
+    X_train = train_df[COMBO_4_FEATURES].copy()
+    y_train_unit = train_df[UNIT_PRICE_TARGET_COL].astype(float).copy()
 
     benchmark_rows = []
     trained_models = []
@@ -535,29 +555,26 @@ def train_models_for_subset(model_df: pd.DataFrame, subset_name: str):
         pipeline = build_training_pipeline(X_train, regressor)
         pipeline.fit(X_train, y_train_unit)
 
-        pred_unit_price = np.clip(np.asarray(pipeline.predict(X_test), dtype=float), a_min=0.0, a_max=None)
-        pred_price = pred_unit_price * np.asarray(area_test, dtype=float) * UNIT_PRICE_SCALE
-        metrics = regression_metrics(y_test_price, pred_price)
-
+        metrics = evaluate_pipeline_on_dataframe(pipeline, test_df)
         benchmark_rows.append(
-            {
-                "Property Type": subset_name,
-                "Rows": int(len(model_df)),
-                "Train Rows": int(len(X_train)),
-                "Test Rows": int(len(X_test)),
-                "Model": model_name,
-                "Target": "Đơn giá x Diện tích",
-                **metrics,
-            }
+            make_benchmark_row(
+                subset_name=subset_name,
+                rows=len(train_df) + len(test_df),
+                train_rows=len(train_df),
+                test_rows=len(test_df),
+                model_name=model_name,
+                metrics=metrics,
+                source="type_specific",
+            )
         )
-        trained_models.append((model_name, pipeline, metrics, len(X_train), len(X_test)))
+        trained_models.append((model_name, pipeline, metrics))
 
     benchmark_df = pd.DataFrame(benchmark_rows).sort_values(
         by=["MAE (bn VND)", "RMSLE"],
         ascending=[True, True],
     ).reset_index(drop=True)
 
-    best_model_name, best_pipeline, best_metrics, train_rows, test_rows = min(
+    best_model_name, best_pipeline, best_metrics = min(
         trained_models,
         key=lambda item: (item[2]["MAE (bn VND)"], item[2]["RMSLE"]),
     )
@@ -567,9 +584,9 @@ def train_models_for_subset(model_df: pd.DataFrame, subset_name: str):
         "best_model_name": best_model_name,
         "best_pipeline": best_pipeline,
         "best_metrics": best_metrics,
-        "train_rows": int(train_rows),
-        "test_rows": int(test_rows),
-        "rows": int(len(model_df)),
+        "train_rows": int(len(train_df)),
+        "test_rows": int(len(test_df)),
+        "rows": int(len(train_df) + len(test_df)),
     }
 
 
@@ -587,7 +604,8 @@ def train_and_export(input_path, output_dir, enable_geocode):
     )
     model_df = prepare_model_dataframe(cleaned_df)
 
-    overall_result = train_models_for_subset(model_df, "ALL")
+    overall_train_df, overall_test_df = split_model_dataframe(model_df)
+    overall_result = train_models_for_subset(overall_train_df, overall_test_df, "ALL")
     benchmark_frames = [overall_result["benchmark_df"]]
     type_summaries = {}
     pipelines_by_type = {}
@@ -599,16 +617,57 @@ def train_and_export(input_path, output_dir, enable_geocode):
         if row_count < MIN_SAMPLES_PER_TYPE:
             continue
 
-        type_df = model_df[property_type_series == property_type].copy()
-        type_result = train_models_for_subset(type_df, property_type)
+        type_train_df = overall_train_df[overall_train_df[PROPERTY_TYPE_COL].fillna("Unknown").astype(str) == property_type].copy()
+        type_test_df = overall_test_df[overall_test_df[PROPERTY_TYPE_COL].fillna("Unknown").astype(str) == property_type].copy()
+        if type_train_df.empty or type_test_df.empty:
+            continue
+
+        type_result = train_models_for_subset(type_train_df, type_test_df, property_type)
+        overall_on_type_metrics = evaluate_pipeline_on_dataframe(overall_result["best_pipeline"], type_test_df)
+
         benchmark_frames.append(type_result["benchmark_df"])
-        pipelines_by_type[property_type] = type_result["best_pipeline"]
+        benchmark_frames.append(
+            pd.DataFrame(
+                [
+                    make_benchmark_row(
+                        subset_name=property_type,
+                        rows=len(type_train_df) + len(type_test_df),
+                        train_rows=len(type_train_df),
+                        test_rows=len(type_test_df),
+                        model_name=overall_result["best_model_name"],
+                        metrics=overall_on_type_metrics,
+                        source="all_model",
+                    )
+                ]
+            )
+        )
+
+        use_all_model = (
+            overall_on_type_metrics["MAE (bn VND)"],
+            overall_on_type_metrics["RMSLE"],
+        ) < (
+            type_result["best_metrics"]["MAE (bn VND)"],
+            type_result["best_metrics"]["RMSLE"],
+        )
+
+        selected_pipeline = overall_result["best_pipeline"] if use_all_model else type_result["best_pipeline"]
+        selected_model_name = overall_result["best_model_name"] if use_all_model else type_result["best_model_name"]
+        selected_metrics = overall_on_type_metrics if use_all_model else type_result["best_metrics"]
+        selected_source = "all_model" if use_all_model else "type_specific"
+
+        pipelines_by_type[property_type] = selected_pipeline
         type_summaries[property_type] = {
-            "best_model_name": type_result["best_model_name"],
-            "metrics": type_result["best_metrics"],
+            "best_model_name": selected_model_name,
+            "selected_model_name": selected_model_name,
+            "selected_source": selected_source,
+            "metrics": selected_metrics,
             "rows": type_result["rows"],
             "train_rows": type_result["train_rows"],
             "test_rows": type_result["test_rows"],
+            "type_specific_model_name": type_result["best_model_name"],
+            "type_specific_metrics": type_result["best_metrics"],
+            "all_model_name": overall_result["best_model_name"],
+            "all_model_metrics": overall_on_type_metrics,
         }
 
     benchmark_df = pd.concat(benchmark_frames, ignore_index=True).sort_values(

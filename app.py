@@ -1,15 +1,21 @@
 import math
+import os
 import re
 import sys
+import traceback
 from pathlib import Path
 
-import joblib
+import gradio as gr
 import numpy as np
 import pandas as pd
-import streamlit as st
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import _column_transformer as sklearn_column_transformer
+
+try:
+    import joblib
+except ModuleNotFoundError:
+    joblib = None
 
 
 PROPERTY_TYPE_COL = "Loại hình"
@@ -28,8 +34,6 @@ ICON_PATTERN = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+", 
 LEADING_TRAILING_DECORATION_PATTERN = re.compile(r"^[\s,.;:|/\-]+|[\s,.;:|/\-]+$", re.UNICODE)
 
 
-# scikit-learn 1.8 no longer exposes this private helper, but older 1.6.x
-# ColumnTransformer pickles may still reference it during unpickling.
 if not hasattr(sklearn_column_transformer, "_RemainderColsList"):
     class _RemainderColsList(list):
         pass
@@ -81,9 +85,9 @@ class MatrixToFrameTransformer(BaseEstimator, TransformerMixin):
         return X
 
 
-# Allow older joblib artifacts that were serialized with the training module path
-# to be loaded without importing the training script on deploy.
 sys.modules.setdefault("train_combo4_xgboost_pipeline", sys.modules[__name__])
+sys.modules.setdefault("model_runtime", sys.modules[__name__])
+sys.modules.setdefault("__main__", sys.modules[__name__])
 
 
 MODEL_PATH = Path("artifacts/combo4_best_unit_price_pipeline.pkl")
@@ -105,12 +109,21 @@ SUBTYPE_FIELDS = [
 ]
 
 
-@st.cache_resource
 def load_artifact():
+    if joblib is None:
+        raise RuntimeError("Missing Python package: joblib.")
+
+    with MODEL_PATH.open("rb") as artifact_file:
+        header = artifact_file.read(64)
+
+    if header.startswith(b"version https://git-lfs.github.com/spec/"):
+        raise RuntimeError(
+            "Model artifact was not downloaded. The file in artifacts is still a Git LFS pointer."
+        )
+
     return joblib.load(MODEL_PATH)
 
 
-@st.cache_data
 def load_raw_address_data():
     df = pd.read_csv(DATA_PATH, low_memory=False, encoding="utf-8-sig")
     return sanitize_location_columns(df)
@@ -196,12 +209,11 @@ def predict_price(model, feature_list, target_mode, unit_price_scale, values):
 
     if target_mode == "unit_price_times_area":
         pred_price = pred_value * area_value * unit_price_scale if area_value is not None else float("nan")
-        result = {
+        return {
             "Giá dự đoán (VND)": format_vnd(pred_price),
             "Giá dự đoán (tỷ VND)": round(pred_price / 1e9, 3) if not math.isnan(pred_price) else None,
             "Đơn giá dự đoán (triệu/m²)": round(pred_value, 4),
         }
-        return result
 
     return {
         "Giá dự đoán (VND)": format_vnd(pred_value),
@@ -231,160 +243,203 @@ def resolve_legacy_address_candidates(df, new_city, new_ward, street):
     return filtered, candidate_summary
 
 
-artifact = load_artifact()
-raw_address_df = load_raw_address_data()
-feature_list = artifact["feature_list"]
-target_mode = artifact.get("target_mode", "price_direct")
-unit_price_scale = float(artifact.get("unit_price_scale", 1.0))
-property_type_column = artifact.get("property_type_column", PROPERTY_TYPE_COL)
+def safe_select(value, options, default=""):
+    return value if value in options else default
 
-st.set_page_config(page_title="Dự đoán giá bất động sản", page_icon="🏠", layout="wide")
 
-st.title("Dự đoán giá bất động sản tại Việt Nam")
-st.caption(
-    "Nhập theo địa chỉ mới từ dataset gốc: Tỉnh/Thành phố mới, rồi Phường/Xã mới, rồi Đường. "
-    "Ứng dụng sẽ tự map sang địa chỉ cũ để đưa vào model dự đoán."
-)
+def compute_form_state(selected_new_city="", selected_new_ward="", selected_street="", selected_old_ward="", selected_property_type=""):
+    new_city_df = RAW_ADDRESS_DF.copy()
+    if selected_new_city:
+        new_city_df = new_city_df[new_city_df[NEW_CITY_FIELD] == selected_new_city]
 
-new_city_options = select_options(raw_address_df[NEW_CITY_FIELD])
-selected_new_city = st.selectbox("Tỉnh/Thành phố mới", new_city_options, index=0)
+    new_ward_options = select_options(new_city_df[NEW_WARD_FIELD])
+    selected_new_ward = safe_select(selected_new_ward, new_ward_options)
 
-new_city_df = raw_address_df.copy()
-if selected_new_city:
-    new_city_df = new_city_df[new_city_df[NEW_CITY_FIELD] == selected_new_city]
+    new_ward_df = new_city_df.copy()
+    if selected_new_ward:
+        new_ward_df = new_ward_df[new_ward_df[NEW_WARD_FIELD] == selected_new_ward]
 
-new_ward_options = select_options(new_city_df[NEW_WARD_FIELD])
-selected_new_ward = st.selectbox("Phường/Xã mới", new_ward_options, index=0)
+    street_options = select_options(new_ward_df[STREET_FIELD])
+    selected_street = safe_select(selected_street, street_options)
 
-new_ward_df = new_city_df.copy()
-if selected_new_ward:
-    new_ward_df = new_ward_df[new_ward_df[NEW_WARD_FIELD] == selected_new_ward]
+    _, legacy_candidates = resolve_legacy_address_candidates(
+        RAW_ADDRESS_DF,
+        selected_new_city,
+        selected_new_ward,
+        selected_street,
+    )
 
-street_options = select_options(new_ward_df[STREET_FIELD])
-selected_street = st.selectbox("Đường", street_options, index=0)
+    legacy_old_ward_options = clean_option_series(legacy_candidates[OLD_WARD_FIELD]) if not legacy_candidates.empty else []
+    old_ward_dropdown_options = [""] + legacy_old_ward_options
+    default_old_ward = legacy_old_ward_options[0] if legacy_old_ward_options else ""
+    selected_old_ward = safe_select(selected_old_ward, legacy_old_ward_options, default_old_ward)
 
-_, legacy_candidates = resolve_legacy_address_candidates(
-    raw_address_df,
+    resolved_candidates = legacy_candidates.copy()
+    if selected_old_ward:
+        resolved_candidates = resolved_candidates[resolved_candidates[OLD_WARD_FIELD] == selected_old_ward]
+
+    resolved_old_city = ""
+    resolved_old_district = ""
+    resolved_old_ward = selected_old_ward
+    if not resolved_candidates.empty:
+        top_match = (
+            resolved_candidates.groupby([OLD_WARD_FIELD, DISTRICT_FIELD, CITY_FIELD], dropna=False)
+            .size()
+            .reset_index(name="rows")
+            .sort_values(by=["rows", OLD_WARD_FIELD, DISTRICT_FIELD, CITY_FIELD], ascending=[False, True, True, True])
+            .iloc[0]
+        )
+        resolved_old_ward = top_match[OLD_WARD_FIELD]
+        resolved_old_district = top_match[DISTRICT_FIELD]
+        resolved_old_city = top_match[CITY_FIELD]
+
+    input_scope_df = RAW_ADDRESS_DF.copy()
+    if resolved_old_city:
+        input_scope_df = input_scope_df[input_scope_df[CITY_FIELD] == resolved_old_city]
+    if resolved_old_district:
+        input_scope_df = input_scope_df[input_scope_df[DISTRICT_FIELD] == resolved_old_district]
+    if selected_street:
+        input_scope_df = input_scope_df[input_scope_df[STREET_FIELD] == selected_street]
+
+    property_type_options = select_options(input_scope_df[PROPERTY_TYPE_COLUMN])
+    selected_property_type = safe_select(selected_property_type, property_type_options)
+
+    type_df = input_scope_df.copy()
+    if selected_property_type:
+        type_df = type_df[type_df[PROPERTY_TYPE_COLUMN] == selected_property_type]
+
+    bedroom_options = select_options(type_df["Số phòng ngủ"]) if "Số phòng ngủ" in type_df.columns else [""]
+    bathroom_options = select_options(type_df["Số phòng vệ sinh"]) if "Số phòng vệ sinh" in type_df.columns else [""]
+    relevant_subtype_fields = find_relevant_subtype_fields(input_scope_df, selected_property_type)
+
+    subtype_updates = []
+    for field in SUBTYPE_FIELDS:
+        is_visible = field in relevant_subtype_fields
+        choices = select_options(type_df[field]) if is_visible and field in type_df.columns else [""]
+        subtype_updates.append(gr.update(choices=choices, value="", visible=is_visible))
+
+    return {
+        "new_ward_options": new_ward_options,
+        "selected_new_ward": selected_new_ward,
+        "street_options": street_options,
+        "selected_street": selected_street,
+        "old_ward_options": old_ward_dropdown_options,
+        "selected_old_ward": selected_old_ward,
+        "old_ward_visible": len(legacy_old_ward_options) > 1,
+        "resolved_old_ward": resolved_old_ward or "",
+        "resolved_old_district": resolved_old_district or "",
+        "resolved_old_city": resolved_old_city or "",
+        "property_type_options": property_type_options,
+        "selected_property_type": selected_property_type,
+        "bedroom_options": bedroom_options,
+        "bathroom_options": bathroom_options,
+        "subtype_updates": subtype_updates,
+    }
+
+
+def refresh_form(selected_new_city, selected_new_ward, selected_street, selected_old_ward, selected_property_type):
+    state = compute_form_state(
+        selected_new_city=selected_new_city or "",
+        selected_new_ward=selected_new_ward or "",
+        selected_street=selected_street or "",
+        selected_old_ward=selected_old_ward or "",
+        selected_property_type=selected_property_type or "",
+    )
+
+    return [
+        gr.update(choices=state["new_ward_options"], value=state["selected_new_ward"]),
+        gr.update(choices=state["street_options"], value=state["selected_street"]),
+        gr.update(choices=state["old_ward_options"], value=state["selected_old_ward"], visible=state["old_ward_visible"]),
+        state["resolved_old_ward"],
+        state["resolved_old_district"],
+        state["resolved_old_city"],
+        gr.update(choices=state["property_type_options"], value=state["selected_property_type"]),
+        gr.update(choices=state["bedroom_options"], value=""),
+        gr.update(choices=state["bathroom_options"], value=""),
+        *state["subtype_updates"],
+    ]
+
+
+def build_prediction_output(
     selected_new_city,
     selected_new_ward,
     selected_street,
-)
-
-legacy_old_ward_options = clean_option_series(legacy_candidates[OLD_WARD_FIELD]) if not legacy_candidates.empty else []
-selected_old_ward = legacy_old_ward_options[0] if legacy_old_ward_options else ""
-
-if len(legacy_old_ward_options) > 1:
-    selected_old_ward = st.selectbox(
-        "Phường/Xã cũ",
-        legacy_old_ward_options,
-        index=0,
-        help="Nếu có nhiều khả năng khớp, app mặc định lấy option đầu tiên nhưng bạn có thể chọn lại.",
+    selected_old_ward,
+    selected_property_type,
+    area_value,
+    selected_bedrooms,
+    selected_bathrooms,
+    subtype_house,
+    subtype_apartment,
+    subtype_land,
+    subtype_office,
+):
+    state = compute_form_state(
+        selected_new_city=selected_new_city or "",
+        selected_new_ward=selected_new_ward or "",
+        selected_street=selected_street or "",
+        selected_old_ward=selected_old_ward or "",
+        selected_property_type=selected_property_type or "",
     )
 
-resolved_candidates = legacy_candidates.copy()
-if selected_old_ward:
-    resolved_candidates = resolved_candidates[resolved_candidates[OLD_WARD_FIELD] == selected_old_ward]
+    if area_value is None or area_value <= 0:
+        return "Vui lòng nhập diện tích lớn hơn 0."
+    if not selected_new_city or not state["selected_new_ward"] or not state["selected_street"] or not state["selected_property_type"]:
+        return "Vui lòng chọn đầy đủ Tỉnh/Thành phố mới, Phường/Xã mới, Đường và Loại hình."
+    if not state["resolved_old_city"] or not state["resolved_old_district"]:
+        return "Không map được địa chỉ cũ từ dữ liệu hiện tại nên chưa thể dự đoán."
 
-resolved_old_city = ""
-resolved_old_district = ""
-resolved_old_ward = selected_old_ward
-if not resolved_candidates.empty:
-    top_match = (
-        resolved_candidates.groupby([OLD_WARD_FIELD, DISTRICT_FIELD, CITY_FIELD], dropna=False)
-        .size()
-        .reset_index(name="rows")
-        .sort_values(by=["rows", OLD_WARD_FIELD, DISTRICT_FIELD, CITY_FIELD], ascending=[False, True, True, True])
-        .iloc[0]
+    model, model_name, model_metrics = get_model_for_property_type(ARTIFACT, state["selected_property_type"])
+    values = {
+        CITY_FIELD: state["resolved_old_city"],
+        DISTRICT_FIELD: state["resolved_old_district"],
+        STREET_FIELD: state["selected_street"],
+        PROPERTY_TYPE_COL: state["selected_property_type"],
+        AREA_FIELD: str(area_value),
+        "Số phòng ngủ": selected_bedrooms,
+        "Số phòng vệ sinh": selected_bathrooms,
+        "Loại hình nhà ở": subtype_house,
+        "Loại hình căn hộ": subtype_apartment,
+        "Loại hình đất": subtype_land,
+        "Loại hình văn phòng": subtype_office,
+    }
+    prediction = predict_price(
+        model=model,
+        feature_list=FEATURE_LIST,
+        target_mode=TARGET_MODE,
+        unit_price_scale=UNIT_PRICE_SCALE,
+        values=values,
     )
-    resolved_old_ward = top_match[OLD_WARD_FIELD]
-    resolved_old_district = top_match[DISTRICT_FIELD]
-    resolved_old_city = top_match[CITY_FIELD]
 
-st.markdown("**Địa chỉ cũ**")
-legacy_col_1, legacy_col_2, legacy_col_3 = st.columns(3)
-legacy_col_1.text_input("Phường/Xã cũ", value=resolved_old_ward or "", disabled=True)
-legacy_col_2.text_input("Huyện/Quận cũ", value=resolved_old_district or "", disabled=True)
-legacy_col_3.text_input("Tỉnh/Thành phố cũ", value=resolved_old_city or "", disabled=True)
+    predicted_price_bn = prediction["Giá dự đoán (tỷ VND)"]
+    predicted_price_vnd = predicted_price_bn * 1e9 if predicted_price_bn is not None else float("nan")
+    lower_bound, upper_bound = build_estimate_range(predicted_price_vnd, model_metrics["MAE (bn VND)"])
 
-input_scope_df = raw_address_df.copy()
-if resolved_old_city:
-    input_scope_df = input_scope_df[input_scope_df[CITY_FIELD] == resolved_old_city]
-if resolved_old_district:
-    input_scope_df = input_scope_df[input_scope_df[DISTRICT_FIELD] == resolved_old_district]
-if selected_street:
-    input_scope_df = input_scope_df[input_scope_df[STREET_FIELD] == selected_street]
+    result_lines = [
+        "## Kết quả dự đoán",
+        f"- Giá dự đoán: **{prediction['Giá dự đoán (VND)']}**",
+    ]
+    if TARGET_MODE == "unit_price_times_area":
+        result_lines.append(f"- Đơn giá dự đoán: **{prediction['Đơn giá dự đoán (triệu/m²)']:.2f} triệu/m²**")
+    result_lines.extend(
+        [
+            "",
+            "## Thông tin model",
+            f"- Model đang dùng: **{model_name}**",
+            f"- Sai lệch trung bình tham khảo: **{format_bn_vnd(model_metrics['MAE (bn VND)'])}**",
+            f"- Khoảng giá tham khảo: **{format_vnd(lower_bound)}** đến **{format_vnd(upper_bound)}**",
+        ]
+    )
+    return "\n".join(result_lines)
 
-property_type_options = select_options(input_scope_df[property_type_column])
-selected_property_type = st.selectbox("Loại hình", property_type_options, index=0)
 
-type_df = input_scope_df.copy()
-if selected_property_type:
-    type_df = type_df[type_df[property_type_column] == selected_property_type]
+def build_summary_dataframe():
+    if not ARTIFACT.get("property_type_models"):
+        return pd.DataFrame()
 
-relevant_subtype_fields = find_relevant_subtype_fields(input_scope_df, selected_property_type)
-
-left_col, right_col = st.columns(2)
-with left_col:
-    area_value = st.number_input("Diện tích", min_value=0.0, step=1.0)
-    bedroom_options = select_options(type_df["Số phòng ngủ"])
-    bathroom_options = select_options(type_df["Số phòng vệ sinh"])
-    selected_bedrooms = st.selectbox("Số phòng ngủ", bedroom_options, index=0)
-    selected_bathrooms = st.selectbox("Số phòng vệ sinh", bathroom_options, index=0)
-
-subtype_values = {}
-with right_col:
-    for field in relevant_subtype_fields:
-        subtype_values[field] = st.selectbox(field, select_options(type_df[field]), index=0)
-
-submitted = st.button("Dự đoán", use_container_width=True)
-
-if submitted:
-    if area_value <= 0:
-        st.error("Vui lòng nhập diện tích lớn hơn 0.")
-    elif not selected_new_city or not selected_new_ward or not selected_street or not selected_property_type:
-        st.error("Vui lòng chọn đầy đủ Tỉnh/Thành phố mới, Phường/Xã mới, Đường và Loại hình.")
-    elif not resolved_old_city or not resolved_old_district:
-        st.error("Không map được địa chỉ cũ từ dữ liệu hiện tại nên chưa thể dự đoán.")
-    else:
-        model, model_name, model_metrics = get_model_for_property_type(artifact, selected_property_type)
-        values = {
-            CITY_FIELD: resolved_old_city,
-            DISTRICT_FIELD: resolved_old_district,
-            STREET_FIELD: selected_street,
-            PROPERTY_TYPE_COL: selected_property_type,
-            AREA_FIELD: str(area_value),
-            "Số phòng ngủ": selected_bedrooms,
-            "Số phòng vệ sinh": selected_bathrooms,
-            "Loại hình nhà ở": subtype_values.get("Loại hình nhà ở", ""),
-            "Loại hình căn hộ": subtype_values.get("Loại hình căn hộ", ""),
-            "Loại hình đất": subtype_values.get("Loại hình đất", ""),
-            "Loại hình văn phòng": subtype_values.get("Loại hình văn phòng", ""),
-        }
-        prediction = predict_price(model, feature_list, target_mode, unit_price_scale, values)
-
-        st.subheader("Kết quả dự đoán")
-        metric_col_1, metric_col_2 = st.columns(2)
-        metric_col_1.metric("Giá dự đoán", prediction["Giá dự đoán (VND)"])
-        if target_mode == "unit_price_times_area":
-            metric_col_2.metric(
-                "Đơn giá dự đoán",
-                f"{prediction['Đơn giá dự đoán (triệu/m²)']:.2f} triệu/m²",
-            )
-
-        predicted_price_bn = prediction["Giá dự đoán (tỷ VND)"]
-        predicted_price_vnd = predicted_price_bn * 1e9 if predicted_price_bn is not None else float("nan")
-        lower_bound, upper_bound = build_estimate_range(predicted_price_vnd, model_metrics["MAE (bn VND)"])
-
-        st.info(
-            f"Model đang dùng: {model_name}. Sai lệch trung bình tham khảo cho nhóm này khoảng "
-            f"{format_bn_vnd(model_metrics['MAE (bn VND)'])}. "
-            f"Mức giá tham khảo có thể hiểu trong khoảng {format_vnd(lower_bound)} đến {format_vnd(upper_bound)}."
-        )
-
-if artifact.get("property_type_models"):
-    summary_rows = []
-    for property_type, info in artifact["property_type_models"].items():
-        summary_rows.append(
+    rows = []
+    for property_type, info in ARTIFACT["property_type_models"].items():
+        rows.append(
             {
                 "Loại hình": property_type,
                 "Model tốt nhất": info["best_model_name"],
@@ -393,5 +448,142 @@ if artifact.get("property_type_models"):
                 "Số mẫu": info["rows"],
             }
         )
-    st.subheader("Model Tốt Nhất Theo Loại Hình")
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    return pd.DataFrame(rows)
+
+
+APP_LOAD_ERROR = None
+ARTIFACT = None
+RAW_ADDRESS_DF = None
+FEATURE_LIST = []
+TARGET_MODE = "price_direct"
+UNIT_PRICE_SCALE = 1.0
+PROPERTY_TYPE_COLUMN = PROPERTY_TYPE_COL
+SUMMARY_DF = pd.DataFrame()
+
+try:
+    ARTIFACT = load_artifact()
+    RAW_ADDRESS_DF = load_raw_address_data()
+    FEATURE_LIST = ARTIFACT["feature_list"]
+    TARGET_MODE = ARTIFACT.get("target_mode", "price_direct")
+    UNIT_PRICE_SCALE = float(ARTIFACT.get("unit_price_scale", 1.0))
+    PROPERTY_TYPE_COLUMN = ARTIFACT.get("property_type_column", PROPERTY_TYPE_COL)
+    SUMMARY_DF = build_summary_dataframe()
+except Exception as exc:
+    APP_LOAD_ERROR = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+
+def build_app():
+    with gr.Blocks(title="Dự đoán giá bất động sản tại Việt Nam") as demo:
+        gr.Markdown("# Dự đoán giá bất động sản tại Việt Nam")
+        gr.Markdown(
+            "Nhập theo địa chỉ mới từ dataset gốc: Tỉnh/Thành phố mới, rồi Phường/Xã mới, rồi Đường. "
+            "Ứng dụng sẽ tự map sang địa chỉ cũ để đưa vào model dự đoán."
+        )
+
+        if APP_LOAD_ERROR:
+            gr.Markdown(
+                "## Không thể khởi tạo ứng dụng\n"
+                f"```text\n{APP_LOAD_ERROR}\n```"
+            )
+            return demo
+
+        new_city_options = select_options(RAW_ADDRESS_DF[NEW_CITY_FIELD])
+        initial_state = compute_form_state()
+
+        with gr.Row():
+            new_city = gr.Dropdown(label="Tỉnh/Thành phố mới", choices=new_city_options, value="")
+            new_ward = gr.Dropdown(
+                label="Phường/Xã mới",
+                choices=initial_state["new_ward_options"],
+                value=initial_state["selected_new_ward"],
+            )
+            street = gr.Dropdown(
+                label="Đường",
+                choices=initial_state["street_options"],
+                value=initial_state["selected_street"],
+            )
+
+        old_ward_choice = gr.Dropdown(
+            label="Phường/Xã cũ",
+            choices=initial_state["old_ward_options"],
+            value=initial_state["selected_old_ward"],
+            visible=initial_state["old_ward_visible"],
+            info="Nếu có nhiều khả năng khớp, bạn có thể chọn lại phường/xã cũ.",
+        )
+
+        gr.Markdown("## Địa chỉ cũ")
+        with gr.Row():
+            resolved_old_ward = gr.Textbox(label="Phường/Xã cũ", value=initial_state["resolved_old_ward"], interactive=False)
+            resolved_old_district = gr.Textbox(label="Huyện/Quận cũ", value=initial_state["resolved_old_district"], interactive=False)
+            resolved_old_city = gr.Textbox(label="Tỉnh/Thành phố cũ", value=initial_state["resolved_old_city"], interactive=False)
+
+        property_type = gr.Dropdown(
+            label="Loại hình",
+            choices=initial_state["property_type_options"],
+            value=initial_state["selected_property_type"],
+        )
+
+        with gr.Row():
+            area = gr.Number(label="Diện tích", value=None, minimum=0)
+            bedrooms = gr.Dropdown(label="Số phòng ngủ", choices=initial_state["bedroom_options"], value="")
+            bathrooms = gr.Dropdown(label="Số phòng vệ sinh", choices=initial_state["bathroom_options"], value="")
+
+        subtype_house = gr.Dropdown(label="Loại hình nhà ở", choices=[""], value="", visible=False)
+        subtype_apartment = gr.Dropdown(label="Loại hình căn hộ", choices=[""], value="", visible=False)
+        subtype_land = gr.Dropdown(label="Loại hình đất", choices=[""], value="", visible=False)
+        subtype_office = gr.Dropdown(label="Loại hình văn phòng", choices=[""], value="", visible=False)
+
+        predict_button = gr.Button("Dự đoán", variant="primary")
+        prediction_output = gr.Markdown()
+
+        if not SUMMARY_DF.empty:
+            gr.Markdown("## Model Tốt Nhất Theo Loại Hình")
+            gr.Dataframe(value=SUMMARY_DF, interactive=False, wrap=True)
+
+        refresh_inputs = [new_city, new_ward, street, old_ward_choice, property_type]
+        refresh_outputs = [
+            new_ward,
+            street,
+            old_ward_choice,
+            resolved_old_ward,
+            resolved_old_district,
+            resolved_old_city,
+            property_type,
+            bedrooms,
+            bathrooms,
+            subtype_house,
+            subtype_apartment,
+            subtype_land,
+            subtype_office,
+        ]
+
+        for component in refresh_inputs:
+            component.change(refresh_form, inputs=refresh_inputs, outputs=refresh_outputs)
+
+        predict_button.click(
+            build_prediction_output,
+            inputs=[
+                new_city,
+                new_ward,
+                street,
+                old_ward_choice,
+                property_type,
+                area,
+                bedrooms,
+                bathrooms,
+                subtype_house,
+                subtype_apartment,
+                subtype_land,
+                subtype_office,
+            ],
+            outputs=prediction_output,
+        )
+
+    return demo
+
+
+demo = build_app()
+
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")))
